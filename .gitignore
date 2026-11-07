@@ -12,7 +12,7 @@ coverage/
 
 -------------------------------------------------------------------------------------
 ZBHEVJgeNMs4R5ii cluster0 password                                                   |
-name - LedgerLine-app                                                                |
+name - ledgerline_app                                                               |
 mongodb+srv://<db_username>:<db_password>@cluster0.inposl7.mongodb.net/              |
                                                                                      |
 -------------------------------------------------------------------------------------
