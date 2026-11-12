@@ -537,6 +537,182 @@ test("Transfer rejects amounts greater than available balance", async () => {
 });
 
 
+test("Concurrent transfers cannot spend the same balance twice", async () => {
+  const uniqueId = crypto.randomUUID();
+
+  let adminId;
+  let customerId;
+  const ledgerIds = [];
+  const accountIds = [];
+
+  try {
+    await prisma.$connect();
+
+    const admin = await prisma.user.create({
+      data: {
+        name: "Concurrency Admin",
+        email: `con-admin-${uniqueId}@balancevault.local`,
+        passwordHash: "test-only-hash",
+        role: "ADMIN"
+      }
+    });
+    adminId = admin.id;
+
+    const customer = await prisma.user.create({
+      data: {
+        name: "Concurrency Customer",
+        email: `con-customer-${uniqueId}@balancevault.local`,
+        passwordHash: "test-only-hash",
+        role: "ACCOUNT_HOLDER"
+      }
+    });
+    customerId = customer.id;
+
+    const codes = ["SOURCE", "DESTONE", "DESTTWO"].map(
+      prefix => `${prefix}${uniqueId.replace(/-/g, "").slice(0, 12)}`
+    );
+
+    const ledgers = [];
+
+    for (let i = 0; i < codes.length; i++) {
+      const ledger = await prisma.ledgerAccount.create({
+        data: {
+          code: codes[i],
+          name: `Concurrency account ${i}`,
+          type: "CUSTOMER"
+        }
+      });
+
+      ledgers.push(ledger);
+      ledgerIds.push(ledger.id);
+    }
+
+    const accounts = [];
+
+    for (let i = 0; i < codes.length; i++) {
+      const account = await prisma.account.create({
+        data: {
+          ownerId: customer.id,
+          accountNumber: codes[i],
+          ledgerAccountId: ledgers[i].id,
+          balancePaise: 0n,
+          currency: "INR"
+        }
+      });
+
+      accounts.push(account);
+      accountIds.push(account.id);
+    }
+
+    const adminToken = jwt.sign({}, process.env.JWT_SECRET, {
+      algorithm: "HS256",
+      subject: admin.id,
+      issuer: "balancevault-api",
+      audience: "balancevault-client",
+      expiresIn: "5m"
+    });
+
+    const customerToken = jwt.sign({}, process.env.JWT_SECRET, {
+      algorithm: "HS256",
+      subject: customer.id,
+      issuer: "balancevault-api",
+      audience: "balancevault-client",
+      expiresIn: "5m"
+    });
+
+    // Fund source account with ₹100
+    const deposit = await request(app)
+      .post("/api/transactions/deposit")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .set("Idempotency-Key", `con-deposit-${uniqueId}`)
+      .send({
+        destinationAccountId: accounts[0].id,
+        amountPaise: "10000"
+      });
+
+    assert.equal(deposit.status, 201);
+
+    // Two simultaneous attempts to transfer ₹80 each
+    const makeTransfer = (destination, key) =>
+      request(app)
+        .post("/api/transactions/transfer")
+        .set("Authorization", `Bearer ${customerToken}`)
+        .set("Idempotency-Key", key)
+        .send({
+          sourceAccountId: accounts[0].id,
+          destinationAccountId: destination,
+          amountPaise: "8000"
+        });
+
+    const results = await Promise.all([
+      makeTransfer(accounts[1].id, `con-a-${uniqueId}`),
+      makeTransfer(accounts[2].id, `con-b-${uniqueId}`)
+    ]);
+
+    const statuses = results.map(result => result.status);
+
+    assert.equal(statuses.filter(status => status === 201).length, 1);
+    assert.equal(statuses.filter(status => status === 409).length, 1);
+
+    // Check all balances
+    const finalAccounts = await prisma.account.findMany({
+      where: { id: { in: accountIds } }
+    });
+
+    const totalBalance = finalAccounts.reduce(
+      (sum, account) => sum + account.balancePaise,
+      0n
+    );
+
+    assert.equal(totalBalance, 10000n);
+
+    const source = finalAccounts.find(
+      account => account.id === accounts[0].id
+    );
+
+    assert.equal(source.balancePaise, 2000n);
+
+  } finally {
+    const actorIds = [adminId, customerId].filter(Boolean);
+
+    if (actorIds.length) {
+      await prisma.ledgerEntry.deleteMany({
+        where: { initiatedById: { in: actorIds } }
+      });
+
+      await prisma.transaction.deleteMany({
+        where: { initiatedById: { in: actorIds } }
+      });
+
+      await prisma.auditEvent.deleteMany({
+        where: { actorId: { in: actorIds } }
+      });
+    }
+
+    if (accountIds.length) {
+      await prisma.account.deleteMany({
+        where: { id: { in: accountIds } }
+      });
+    }
+
+    if (ledgerIds.length) {
+      await prisma.ledgerAccount.deleteMany({
+        where: { id: { in: ledgerIds } }
+      });
+    }
+
+    if (customerId) {
+      await prisma.user.deleteMany({ where: { id: customerId } });
+    }
+
+    if (adminId) {
+      await prisma.user.deleteMany({ where: { id: adminId } });
+    }
+  }
+});
+
+
+
 after(async () => {
   // Remove only records created by this test
   if (testUserId) {
