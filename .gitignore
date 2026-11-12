@@ -9,6 +9,8 @@ coverage/
 *.log
 .DS_Store
 
+backend/src/generated/
+
 
 -------------------------------------------------------------------------------------
 ZBHEVJgeNMs4R5ii cluster0 password                                                   |
