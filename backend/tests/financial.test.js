@@ -244,6 +244,27 @@ test("Transfer moves money correctly between two accounts", async () => {
 
     assert.equal(transferResponse.status, 201);
 
+    // 8. Repeat the exact same request with the same idempotency key
+    const duplicateResponse = await request(app)
+      .post("/api/transactions/transfer")
+      .set("Authorization", `Bearer ${customerToken}`)
+      .set("Idempotency-Key", `transfer-${uniqueId}`)
+      .send({
+        sourceAccountId: source.id,
+        destinationAccountId: destination.id,
+        amountPaise: "4000"
+      });
+
+    // The server should return the already processed transaction
+    assert.equal(duplicateResponse.status, 200);
+
+    // Both responses must refer to the same transaction
+    assert.equal(
+      duplicateResponse.body.transaction.id,
+      transferResponse.body.transaction.id
+    );
+
+
     // 8. Verify actual database balances
     const updatedSource = await prisma.account.findUnique({
       where: { id: source.id }
@@ -325,6 +346,192 @@ test("Transfer moves money correctly between two accounts", async () => {
       await prisma.user.deleteMany({
         where: { id: { in: adminId } }
       });
+    }
+  }
+});
+
+
+test("Transfer rejects amounts greater than available balance", async () => {
+  const uniqueId = crypto.randomUUID();
+  let adminId;
+  let customerId;
+  let sourceLedgerId;
+  let destinationLedgerId;
+  let sourceId;
+  let destinationId;
+
+  try {
+    await prisma.$connect();
+
+    // Create temporary admin
+    const admin = await prisma.user.create({
+      data: {
+        name: "Overdraft Test Admin",
+        email: `overdraft-admin-${uniqueId}@balancevault.local`,
+        passwordHash: "test-only-hash",
+        role: "ADMIN"
+      }
+    });
+    adminId = admin.id;
+
+    // Create temporary customer
+    const customer = await prisma.user.create({
+      data: {
+        name: "Overdraft Test Customer",
+        email: `overdraft-customer-${uniqueId}@balancevault.local`,
+        passwordHash: "test-only-hash",
+        role: "ACCOUNT_HOLDER"
+      }
+    });
+    customerId = customer.id;
+
+    // Create two ledger accounts
+    const sourceLedger = await prisma.ledgerAccount.create({
+      data: {
+        code: `OVS${uniqueId.replace(/-/g, "").slice(0, 16)}`,
+        name: "Overdraft Source",
+        type: "CUSTOMER"
+      }
+    });
+    sourceLedgerId = sourceLedger.id;
+
+    const destinationLedger = await prisma.ledgerAccount.create({
+      data: {
+        code: `OVD${uniqueId.replace(/-/g, "").slice(0, 16)}`,
+        name: "Overdraft Destination",
+        type: "CUSTOMER"
+      }
+    });
+    destinationLedgerId = destinationLedger.id;
+
+    // Create two accounts
+    const source = await prisma.account.create({
+      data: {
+        ownerId: customer.id,
+        accountNumber: sourceLedger.code,
+        ledgerAccountId: sourceLedger.id,
+        balancePaise: 0n,
+        currency: "INR"
+      }
+    });
+    sourceId = source.id;
+
+    const destination = await prisma.account.create({
+      data: {
+        ownerId: customer.id,
+        accountNumber: destinationLedger.code,
+        ledgerAccountId: destinationLedger.id,
+        balancePaise: 0n,
+        currency: "INR"
+      }
+    });
+    destinationId = destination.id;
+
+    const adminToken = jwt.sign({}, process.env.JWT_SECRET, {
+      algorithm: "HS256",
+      subject: admin.id,
+      issuer: "balancevault-api",
+      audience: "balancevault-client",
+      expiresIn: "5m"
+    });
+
+    // Deposit ₹100
+    const deposit = await request(app)
+      .post("/api/transactions/deposit")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .set("Idempotency-Key", `overdraft-deposit-${uniqueId}`)
+      .send({
+        destinationAccountId: source.id,
+        amountPaise: "10000"
+      });
+
+    assert.equal(deposit.status, 201);
+
+    const customerToken = jwt.sign({}, process.env.JWT_SECRET, {
+      algorithm: "HS256",
+      subject: customer.id,
+      issuer: "balancevault-api",
+      audience: "balancevault-client",
+      expiresIn: "5m"
+    });
+
+    // Attempt to transfer ₹150
+    const transfer = await request(app)
+      .post("/api/transactions/transfer")
+      .set("Authorization", `Bearer ${customerToken}`)
+      .set("Idempotency-Key", `overdraft-transfer-${uniqueId}`)
+      .send({
+        sourceAccountId: source.id,
+        destinationAccountId: destination.id,
+        amountPaise: "15000"
+      });
+
+    // Insufficient funds should be rejected
+    assert.equal(transfer.status, 409);
+
+    // Verify source balance remains ₹100
+    const updatedSource = await prisma.account.findUnique({
+      where: { id: source.id }
+    });
+
+    assert.equal(updatedSource.balancePaise, 10000n);
+
+    // Verify destination remains ₹0
+    const updatedDestination = await prisma.account.findUnique({
+      where: { id: destination.id }
+    });
+
+    assert.equal(updatedDestination.balancePaise, 0n);
+
+    // Verify no successful transfer was recorded
+    const transferCount = await prisma.transaction.count({
+      where: {
+        initiatedById: customer.id,
+        idempotencyKey: `overdraft-transfer-${uniqueId}`
+      }
+    });
+
+    assert.equal(transferCount, 0);
+
+  } finally {
+    const actorIds = [adminId, customerId].filter(Boolean);
+
+    if (actorIds.length) {
+      await prisma.ledgerEntry.deleteMany({
+        where: { initiatedById: { in: actorIds } }
+      });
+
+      await prisma.transaction.deleteMany({
+        where: { initiatedById: { in: actorIds } }
+      });
+
+      await prisma.auditEvent.deleteMany({
+        where: { actorId: { in: actorIds } }
+      });
+    }
+
+    if (sourceId || destinationId) {
+      await prisma.account.deleteMany({
+        where: {
+          id: { in: [sourceId, destinationId].filter(Boolean) }
+        }
+      });
+    }
+
+    const ledgerIds = [sourceLedgerId, destinationLedgerId].filter(Boolean);
+
+    if (ledgerIds.length) {
+      await prisma.ledgerAccount.deleteMany({
+        where: { id: { in: ledgerIds } }
+      });
+    }
+
+    if (customerId) {
+      await prisma.user.deleteMany({ where: { id: customerId } });
+    }
+
+    if (adminId) {
+      await prisma.user.deleteMany({ where: { id: adminId } });
     }
   }
 });
