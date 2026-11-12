@@ -12,6 +12,10 @@ const {
   depositMoney
 } = require("../controllers/transactionController");
 
+const {
+  getTransactionHistory
+} = require("../controllers/transactionHistoryController");
+
 // Transfer money: account holders only
 router.post(
   "/transfer",
@@ -26,6 +30,14 @@ router.post(
   authenticate,
   authorize("ADMIN"),
   depositMoney
+);
+
+// Transaction history: account holders, admins and auditors
+router.get(
+  "/history",
+  authenticate,
+  authorize("ACCOUNT_HOLDER", "ADMIN", "AUDITOR"),
+  getTransactionHistory
 );
 
 module.exports = router;
