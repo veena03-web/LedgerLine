@@ -172,12 +172,24 @@ const transferMoney = async (req, res) => {
             return res.status(status).json({ message });
         }
 
-        return res.status(result.existing ? 200 : 201).json({
-            message: result.existing
-                ? "Previously processed transfer returned"
-                : "Transfer successful",
-            transaction: result.transaction
-        });
+        
+const transaction = result.transaction || result.existing;
+
+return res.status(result.existing ? 200 : 201).json({
+  message: result.existing
+    ? "Transaction already processed."
+    : "Transfer successful.",
+  transaction: {
+    id: transaction.id,
+    type: transaction.type,
+    amountPaise: transaction.amountPaise.toString(),
+    status: transaction.status,
+    sourceAccountId: transaction.sourceAccountId,
+    destinationAccountId: transaction.destinationAccountId,
+    createdAt: transaction.createdAt
+  }
+});
+
 
     } catch (error) {
         console.error("Transfer error:", error.message);
