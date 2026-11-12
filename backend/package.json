@@ -3,10 +3,11 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "tsx server.js",
-    "dev": "tsx watch server.js",
-    "bootstrap:admin": "tsx scripts/bootstrapAdmin.js"
-  },
+  "start": "node start.js",
+  "dev": "tsx watch start.js",
+  "test": "tsx --test tests/*.test.js",
+  "bootstrap:admin": "tsx scripts/bootstrapAdmin.js"
+},
   "keywords": [],
   "author": "",
   "license": "ISC",
@@ -28,6 +29,7 @@
   "devDependencies": {
     "nodemon": "^3.1.14",
     "prisma": "^7.10.1",
+    "supertest": "^7.3.2",
     "tsx": "^4.23.15"
   }
 }
