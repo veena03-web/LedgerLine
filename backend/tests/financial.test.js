@@ -83,6 +83,21 @@ test("Deposit creates two equal and opposite ledger entries", async () => {
 
   assert.equal(response.status, 201);
   assert.equal(response.body.transaction.amountPaise, "10000");
+  // Repeat the same deposit request with the same idempotency key
+const duplicateResponse = await request(app)
+  .post("/api/transactions/deposit")
+  .set("Authorization", `Bearer ${token}`)
+  .set("Idempotency-Key", `deposit-${uniqueId}`)
+  .send({
+    destinationAccountId: account.id,
+    amountPaise: "10000"
+  });
+
+assert.equal(duplicateResponse.status, 200);
+assert.equal(
+  duplicateResponse.body.transaction.id,
+  response.body.transaction.id
+);
 
   testTransactionId = response.body.transaction.id;
 
@@ -91,6 +106,7 @@ test("Deposit creates two equal and opposite ledger entries", async () => {
     where: { id: account.id }
   });
 
+  assert.equal(updatedAccount.balancePaise, 10000n);
   assert.equal(updatedAccount.balancePaise, 10000n);
 
   // 7. Read the actual ledger entries
@@ -299,7 +315,11 @@ test("Transfer moves money correctly between two accounts", async () => {
     assert.equal(credit.amountPaise, 4000n);
     assert.equal(debit.ledgerAccountId, sourceLedger.id);
     assert.equal(credit.ledgerAccountId, destinationLedger.id);
+    // Verify balance snapshots after transfer
+assert.equal(debit.balanceAfterPaise, 6000n);
+assert.equal(credit.balanceAfterPaise, 4000n);
     assert.equal(transaction.status, "POSTED");
+    
 
     assert.equal(
       updatedSource.balancePaise + updatedDestination.balancePaise,
@@ -711,6 +731,21 @@ test("Concurrent transfers cannot spend the same balance twice", async () => {
   }
 });
 
+
+test("Database rejects zero and negative ledger amounts", async () => {
+  await assert.rejects(
+    prisma.ledgerEntry.create({
+      data: {
+        transactionId: crypto.randomUUID(),
+        ledgerAccountId: crypto.randomUUID(),
+        initiatedById: crypto.randomUUID(),
+        lineNumber: 1,
+        side: "DEBIT",
+        amountPaise: 0n
+      }
+    })
+  );
+});
 
 
 after(async () => {

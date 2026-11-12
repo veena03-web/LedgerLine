@@ -4,6 +4,7 @@ const jwt = require("jsonwebtoken");
 const prisma = require("../config/prisma");
 
 // Register a new account holder
+
 const register = async (req, res) => {
     try {
         const { name, email, password } = req.body;
@@ -16,22 +17,32 @@ const register = async (req, res) => {
         }
 
         // 2. Validate name
-        if (typeof name !== "string" || name.trim().length < 2 || name.trim().length > 100) {
+        if (
+            typeof name !== "string" ||
+            name.trim().length < 2 ||
+            name.trim().length > 100
+        ) {
             return res.status(400).json({
                 message: "Name must contain 2 to 100 characters"
             });
         }
 
         // 3. Validate email
-        if (typeof email !== "string" ||
-            !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+        if (
+            typeof email !== "string" ||
+            !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+        ) {
             return res.status(400).json({
                 message: "Please provide a valid email address"
             });
         }
 
         // 4. Validate password
-        if (typeof password !== "string" || password.length < 8 || password.length > 72) {
+        if (
+            typeof password !== "string" ||
+            password.length < 8 ||
+            password.length > 72
+        ) {
             return res.status(400).json({
                 message: "Password must contain 8 to 72 characters"
             });
@@ -53,57 +64,38 @@ const register = async (req, res) => {
         // 6. Hash password
         const passwordHash = await bcrypt.hash(password, 12);
 
-        // 7. Create user with a safe default role
-        
-// 7. Create user and audit event in one transaction
-const user = await prisma.$transaction(async (tx) => {
+        // 7. Create user and audit event atomically
+        const user = await prisma.$transaction(async (tx) => {
+            const createdUser = await tx.user.create({
+                data: {
+                    name: name.trim(),
+                    email: normalizedEmail,
+                    passwordHash,
+                    role: "ACCOUNT_HOLDER"
+                },
+                select: {
+                    id: true,
+                    name: true,
+                    email: true,
+                    role: true,
+                    createdAt: true
+                }
+            });
 
-    const createdUser = await tx.user.create({
-        data: {
-            name: name.trim(),
-            email: normalizedEmail,
-            passwordHash,
-            role: "ACCOUNT_HOLDER"
-        },
-        select: {
-            id: true,
-            name: true,
-            email: true,
-            role: true,
-            createdAt: true
-        }
-    });
+            await tx.auditEvent.create({
+                data: {
+                    actorId: createdUser.id,
+                    action: "USER_REGISTERED",
+                    targetType: "User",
+                    targetId: createdUser.id,
+                    ipAddress: req.ip
+                }
+            });
 
-    await tx.auditEvent.create({
-        data: {
-            actorId: createdUser.id,
-            action: "USER_REGISTERED",
-            targetType: "User",
-            targetId: createdUser.id,
-            ipAddress: req.ip
-        }
-    });
-
-    return createdUser;
-});
-
-return res.status(201).json({
-    message: "Registration successful",
-    user
-});
-
-
-        // 8. Record registration in audit log
-        await prisma.auditEvent.create({
-            data: {
-                actorId: user.id,
-                action: "USER_REGISTERED",
-                targetType: "User",
-                targetId: user.id,
-                ipAddress: req.ip
-            }
+            return createdUser;
         });
 
+        // 8. Return successful registration
         return res.status(201).json({
             message: "Registration successful",
             user
@@ -124,6 +116,7 @@ return res.status(201).json({
         });
     }
 };
+
 
 
 const login = async (req, res) => {

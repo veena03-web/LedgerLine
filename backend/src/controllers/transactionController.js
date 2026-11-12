@@ -110,37 +110,42 @@ const transferMoney = async (req, res) => {
             });
 
             // Update both account balances
-            await tx.account.update({
-                where: { id: sourceAccountId },
-                data: { balancePaise: { decrement: amount } }
-            });
+            
+// Update both account balances
+const updatedSource = await tx.account.update({
+    where: { id: sourceAccountId },
+    data: { balancePaise: { decrement: amount } }
+});
 
-            await tx.account.update({
-                where: { id: destinationAccountId },
-                data: { balancePaise: { increment: amount } }
-            });
+const updatedDestination = await tx.account.update({
+    where: { id: destinationAccountId },
+    data: { balancePaise: { increment: amount } }
+});
 
-            // Create balanced double-entry ledger records
-            await tx.ledgerEntry.createMany({
-                data: [
-                    {
-                        transactionId: transaction.id,
-                        ledgerAccountId: source.ledgerAccountId,
-                        initiatedById: req.user.id,
-                        lineNumber: 1,
-                        side: "DEBIT",
-                        amountPaise: amount
-                    },
-                    {
-                        transactionId: transaction.id,
-                        ledgerAccountId: destination.ledgerAccountId,
-                        initiatedById: req.user.id,
-                        lineNumber: 2,
-                        side: "CREDIT",
-                        amountPaise: amount
-                    }
-                ]
-            });
+// Create balanced double-entry ledger records
+await tx.ledgerEntry.createMany({
+    data: [
+        {
+            transactionId: transaction.id,
+            ledgerAccountId: source.ledgerAccountId,
+            initiatedById: req.user.id,
+            lineNumber: 1,
+            side: "DEBIT",
+            amountPaise: amount,
+            balanceAfterPaise: updatedSource.balancePaise
+        },
+        {
+            transactionId: transaction.id,
+            ledgerAccountId: destination.ledgerAccountId,
+            initiatedById: req.user.id,
+            lineNumber: 2,
+            side: "CREDIT",
+            amountPaise: amount,
+            balanceAfterPaise: updatedDestination.balancePaise
+        }
+    ]
+});
+
 
             // Record the transfer in the audit log
             await tx.auditEvent.create({
@@ -200,11 +205,16 @@ return res.status(result.existing ? 200 : 201).json({
             });
         }
 
-        if (error.code === "P2034") {
-            return res.status(409).json({
-                message: "Transaction conflict. Retry with the same idempotency key."
-            });
-        }
+        if (
+    error.code === "P2034" ||
+    error.code === "40001" ||
+    error.meta?.code === "40001" ||
+    error.cause?.code === "40001"
+) {
+    return res.status(409).json({
+        message: "Transaction conflict. Retry with the same idempotency key."
+    });
+}
 
         return res.status(500).json({
             message: "Transfer failed"
