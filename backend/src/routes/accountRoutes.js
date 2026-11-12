@@ -5,7 +5,8 @@ const router = express.Router();
 const {
     createAccount,
     getMyAccounts,
-    getAccountBalance
+    getAccountBalance,
+    getAllAccounts
 } = require("../controllers/accountController");
 
 const {
@@ -13,10 +14,15 @@ const {
     authorize
 } = require("../middleware/authMiddleware");
 
-router.use(authenticate, authorize("ACCOUNT_HOLDER"));
+// All routes require authentication
+router.use(authenticate);
 
-router.post("/", createAccount);
-router.get("/", getMyAccounts);
-router.get("/:id/balance", getAccountBalance);
+// Customer routes
+router.post("/", authorize("ACCOUNT_HOLDER"), createAccount);
+router.get("/", authorize("ACCOUNT_HOLDER"), getMyAccounts);
+router.get("/:id/balance", authorize("ACCOUNT_HOLDER"), getAccountBalance);
+
+// Admin-only route
+router.get("/admin/all", authorize("ADMIN"), getAllAccounts);
 
 module.exports = router;

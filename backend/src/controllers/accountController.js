@@ -153,8 +153,45 @@ const getAccountBalance = async (req, res) => {
     }
 };
 
+
+// List all customer accounts - ADMIN ONLY
+const getAllAccounts = async (req, res) => {
+    try {
+        const accounts = await prisma.account.findMany({
+            select: {
+                id: true,
+                accountNumber: true,
+                balancePaise: true,
+                currency: true,
+                status: true,
+                createdAt: true
+            },
+            orderBy: {
+                createdAt: "desc"
+            }
+        });
+
+        return res.json({
+            count: accounts.length,
+            accounts: accounts.map(account => ({
+                ...account,
+                balancePaise: account.balancePaise.toString()
+            }))
+        });
+
+    } catch (error) {
+        console.error("Admin account retrieval error:", error.message);
+
+        return res.status(500).json({
+            message: "Could not retrieve customer accounts"
+        });
+    }
+};
+
+
 module.exports = {
     createAccount,
     getMyAccounts,
-    getAccountBalance
+    getAccountBalance,
+    getAllAccounts
 };
