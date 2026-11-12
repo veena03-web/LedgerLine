@@ -3,11 +3,11 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-  "start": "node start.js",
-  "dev": "tsx watch start.js",
-  "test": "tsx --test tests/*.test.js",
-  "bootstrap:admin": "tsx scripts/bootstrapAdmin.js"
-},
+    "start": "tsx start.js",
+    "dev": "tsx watch start.js",
+    "test": "tsx --test tests/*.test.js",
+    "bootstrap:admin": "tsx scripts/bootstrapAdmin.js"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
