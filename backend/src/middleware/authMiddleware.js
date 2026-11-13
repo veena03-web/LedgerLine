@@ -34,20 +34,28 @@ const authenticate = async (req, res, next) => {
         );
 
         // Get current user and role from database
-        const user = await prisma.user.findUnique({
+                const user = await prisma.user.findUnique({
             where: { id: decoded.sub },
             select: {
                 id: true,
                 name: true,
                 email: true,
                 role: true,
-                isActive: true
+                isActive: true,
+                tokenVersion: true
             }
         });
 
-        if (!user || !user.isActive) {
+                if (!user || !user.isActive) {
             return res.status(401).json({
                 message: "User not found or account is inactive"
+            });
+        }
+
+        // Reject tokens issued before a password reset
+        if ((decoded.tokenVersion ?? 0) !== user.tokenVersion) {
+            return res.status(401).json({
+                message: "Session expired. Please log in again."
             });
         }
 

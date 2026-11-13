@@ -191,9 +191,10 @@ const login = async (req, res) => {
         });
 
         // 7. Create signed token
-        const token = jwt.sign(
+                const token = jwt.sign(
             {
-                role: user.role
+                role: user.role,
+                tokenVersion: user.tokenVersion
             },
             process.env.JWT_SECRET,
             {

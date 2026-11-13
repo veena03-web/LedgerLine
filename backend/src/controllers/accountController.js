@@ -189,9 +189,142 @@ const getAllAccounts = async (req, res) => {
 };
 
 
+// PATCH /api/accounts/:id/close
+// Admin: safely close a customer bank account
+const closeAccount = async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const result = await prisma.$transaction(async (tx) => {
+            // 1. Lock the account row to prevent concurrent changes
+            const lockedAccounts = await tx.$queryRaw`
+                SELECT id
+                FROM "Account"
+                WHERE id = ${id}::uuid
+                FOR UPDATE
+            `;
+
+            if (lockedAccounts.length === 0) {
+                return { notFound: true };
+            }
+
+            // 2. Retrieve the account after acquiring the lock
+            const account = await tx.account.findUnique({
+                where: { id },
+                select: {
+                    id: true,
+                    accountNumber: true,
+                    balancePaise: true,
+                    status: true
+                }
+            });
+
+            if (!account) {
+                return { notFound: true };
+            }
+
+            // 3. Only active accounts can be closed
+            if (account.status !== "ACTIVE") {
+                return { invalidStatus: true, status: account.status };
+            }
+
+            // 4. An account must have zero balance
+            if (account.balancePaise !== 0n) {
+                return { nonZeroBalance: true };
+            }
+
+            // 5. Reject accounts with unresolved transactions
+            const unresolvedTransactions = await tx.transaction.count({
+                where: {
+                    status: { in: ["PENDING"] },
+                    OR: [
+                        { sourceAccountId: id },
+                        { destinationAccountId: id }
+                    ]
+                }
+            });
+
+            if (unresolvedTransactions > 0) {
+                return { unresolvedTransactions: true };
+            }
+
+            // 6. Close the account without deleting financial records
+            const closedAccount = await tx.account.update({
+                where: { id },
+                data: { status: "CLOSED" },
+                select: {
+                    id: true,
+                    accountNumber: true,
+                    balancePaise: true,
+                    currency: true,
+                    status: true
+                }
+            });
+
+            // 7. Record the administrative action
+            await tx.auditEvent.create({
+                data: {
+                    actorId: req.user.id,
+                    action: "ACCOUNT_CLOSED",
+                    targetType: "Account",
+                    targetId: id,
+                    ipAddress: req.ip
+                }
+            });
+
+            return { account: closedAccount };
+        }, {
+            isolationLevel: "Serializable",
+            maxWait: 10000,
+            timeout: 15000
+        });
+
+        if (result.notFound) {
+            return res.status(404).json({
+                message: "Account not found"
+            });
+        }
+
+        if (result.invalidStatus) {
+            return res.status(409).json({
+                message: `Only ACTIVE accounts can be closed. Current status: ${result.status}`
+            });
+        }
+
+        if (result.nonZeroBalance) {
+            return res.status(409).json({
+                message: "Account cannot be closed because its balance is not zero"
+            });
+        }
+
+        if (result.unresolvedTransactions) {
+            return res.status(409).json({
+                message: "Account cannot be closed because it has unresolved transactions"
+            });
+        }
+
+        return res.status(200).json({
+            message: "Bank account closed successfully",
+            account: {
+                ...result.account,
+                balancePaise: result.account.balancePaise.toString()
+            }
+        });
+
+    } catch (error) {
+        console.error("Account closure error:", error.message);
+
+        return res.status(500).json({
+            message: "Could not close bank account"
+        });
+    }
+};
+
+
 module.exports = {
     createAccount,
     getMyAccounts,
     getAccountBalance,
-    getAllAccounts
+    getAllAccounts,
+    closeAccount
 };

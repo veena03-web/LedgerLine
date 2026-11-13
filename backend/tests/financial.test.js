@@ -982,6 +982,854 @@ assert.equal(credit.amountPaise, 4000n);
 });
 
 
+test("Admin can list, search, and view customers while non-admin access is blocked", async () => {
+    await prisma.$connect();
+
+    const uniqueId = crypto.randomUUID();
+
+    let adminId;
+    let customerId;
+
+    try {
+        // 1. Create a temporary admin
+        const admin = await prisma.user.create({
+            data: {
+                name: "User Management Admin",
+                email: `um-admin-${uniqueId}@balancevault.local`,
+                passwordHash: "test-only-hash",
+                role: "ADMIN"
+            }
+        });
+
+        adminId = admin.id;
+
+        // 2. Create a temporary customer
+        const customer = await prisma.user.create({
+            data: {
+                name: "User Management Customer",
+                email: `um-customer-${uniqueId}@balancevault.local`,
+                passwordHash: "test-only-hash",
+                role: "ACCOUNT_HOLDER"
+            }
+        });
+
+        customerId = customer.id;
+
+        // 3. Generate valid JWT tokens
+        const adminToken = jwt.sign({}, process.env.JWT_SECRET, {
+            algorithm: "HS256",
+            subject: admin.id,
+            issuer: "balancevault-api",
+            audience: "balancevault-client",
+            expiresIn: "5m"
+        });
+
+        const customerToken = jwt.sign({}, process.env.JWT_SECRET, {
+            algorithm: "HS256",
+            subject: customer.id,
+            issuer: "balancevault-api",
+            audience: "balancevault-client",
+            expiresIn: "5m"
+        });
+
+        // 4. Admin lists customers
+        const listResponse = await request(app)
+            .get("/api/users")
+            .set("Authorization", `Bearer ${adminToken}`);
+
+        assert.equal(listResponse.status, 200);
+        assert.ok(Array.isArray(listResponse.body.users));
+        assert.ok(
+            listResponse.body.users.some(user => user.id === customer.id),
+            "Customer should appear in the admin customer list"
+        );
+
+        // 5. Admin searches for the customer by name
+        const searchResponse = await request(app)
+            .get("/api/users")
+            .query({ search: "User Management Customer" })
+            .set("Authorization", `Bearer ${adminToken}`);
+
+        assert.equal(searchResponse.status, 200);
+        assert.ok(
+            searchResponse.body.users.some(user => user.id === customer.id),
+            "Search should return the matching customer"
+        );
+
+        // 6. Admin views individual customer details
+        const detailsResponse = await request(app)
+            .get(`/api/users/${customer.id}`)
+            .set("Authorization", `Bearer ${adminToken}`);
+
+        assert.equal(detailsResponse.status, 200);
+        assert.equal(detailsResponse.body.user.id, customer.id);
+        assert.equal(detailsResponse.body.user.email, customer.email);
+        assert.equal(detailsResponse.body.user.role, "ACCOUNT_HOLDER");
+
+        // 7. Customer must not access the admin customer list
+        const forbiddenResponse = await request(app)
+            .get("/api/users")
+            .set("Authorization", `Bearer ${customerToken}`);
+
+        assert.equal(forbiddenResponse.status, 403);
+
+        // 8. Customer must not view another customer's details
+        const forbiddenDetails = await request(app)
+            .get(`/api/users/${customer.id}`)
+            .set("Authorization", `Bearer ${customerToken}`);
+
+        assert.equal(forbiddenDetails.status, 403);
+
+        // 9. Unauthenticated request must be rejected
+        const unauthenticatedResponse = await request(app)
+            .get("/api/users");
+
+        assert.equal(unauthenticatedResponse.status, 401);
+
+    } finally {
+        // Remove only the temporary test users
+        const userIds = [adminId, customerId].filter(Boolean);
+
+        if (userIds.length) {
+            await prisma.auditEvent.deleteMany({
+                where: { actorId: { in: userIds } }
+            });
+
+            await prisma.user.deleteMany({
+                where: { id: { in: userIds } }
+            });
+        }
+    }
+});
+
+
+test("Admin can create customers with secure passwords and bank accounts", async () => {
+    await prisma.$connect();
+
+    const bcrypt = require("bcryptjs");
+    const uniqueId = crypto.randomUUID();
+
+    let adminId;
+    let customerId;
+    let accountId;
+    let ledgerAccountId;
+
+    try {
+        // 1. Create a temporary admin
+        const admin = await prisma.user.create({
+            data: {
+                name: "Customer Creation Admin",
+                email: `create-admin-${uniqueId}@balancevault.local`,
+                passwordHash: "test-only-hash",
+                role: "ADMIN"
+            }
+        });
+
+        adminId = admin.id;
+
+        // 2. Create a regular account holder
+        const regularUser = await prisma.user.create({
+            data: {
+                name: "Regular Test User",
+                email: `regular-${uniqueId}@balancevault.local`,
+                passwordHash: "test-only-hash",
+                role: "ACCOUNT_HOLDER"
+            }
+        });
+
+        const adminToken = jwt.sign({}, process.env.JWT_SECRET, {
+            algorithm: "HS256",
+            subject: admin.id,
+            issuer: "balancevault-api",
+            audience: "balancevault-client",
+            expiresIn: "5m"
+        });
+
+        const customerToken = jwt.sign({}, process.env.JWT_SECRET, {
+            algorithm: "HS256",
+            subject: regularUser.id,
+            issuer: "balancevault-api",
+            audience: "balancevault-client",
+            expiresIn: "5m"
+        });
+
+        // 3. Admin creates a new customer
+        const customerEmail = `new-customer-${uniqueId}@balancevault.local`;
+        const customerPassword = "SecureTestPass123!";
+
+        const createResponse = await request(app)
+            .post("/api/users")
+            .set("Authorization", `Bearer ${adminToken}`)
+            .send({
+                name: "New Test Customer",
+                email: customerEmail,
+                password: customerPassword
+            });
+
+        assert.equal(createResponse.status, 201);
+        assert.equal(
+            createResponse.body.customer.email,
+            customerEmail
+        );
+        assert.equal(
+            createResponse.body.customer.role,
+            "ACCOUNT_HOLDER"
+        );
+
+        customerId = createResponse.body.customer.id;
+        accountId = createResponse.body.account.id;
+
+        assert.equal(createResponse.body.account.balancePaise, "0");
+        assert.equal(createResponse.body.account.status, "ACTIVE");
+        assert.equal(
+            createResponse.body.account.currency,
+            "INR"
+        );
+
+        // 4. Verify the customer exists in the database
+        const savedCustomer = await prisma.user.findUnique({
+            where: { id: customerId }
+        });
+
+        assert.ok(savedCustomer);
+        assert.equal(savedCustomer.isActive, true);
+
+        // 5. Verify password was securely hashed
+        assert.notEqual(savedCustomer.passwordHash, customerPassword);
+
+        assert.equal(
+            await bcrypt.compare(
+                customerPassword,
+                savedCustomer.passwordHash
+            ),
+            true
+        );
+
+        // Password must never appear in the API response
+        assert.equal(
+            Object.hasOwn(createResponse.body.customer, "password"),
+            false
+        );
+        assert.equal(
+            Object.hasOwn(createResponse.body.customer, "passwordHash"),
+            false
+        );
+
+        // 6. Verify the bank account and ledger account exist
+        const savedAccount = await prisma.account.findUnique({
+            where: { id: accountId }
+        });
+
+        assert.ok(savedAccount);
+        assert.equal(savedAccount.ownerId, customerId);
+        assert.equal(savedAccount.balancePaise, 0n);
+
+        ledgerAccountId = savedAccount.ledgerAccountId;
+
+        const savedLedger = await prisma.ledgerAccount.findUnique({
+            where: { id: ledgerAccountId }
+        });
+
+        assert.ok(savedLedger);
+        assert.equal(savedLedger.type, "CUSTOMER");
+
+        // 7. Duplicate email must be rejected
+        const duplicateResponse = await request(app)
+            .post("/api/users")
+            .set("Authorization", `Bearer ${adminToken}`)
+            .send({
+                name: "Duplicate Customer",
+                email: customerEmail,
+                password: customerPassword
+            });
+
+        assert.equal(duplicateResponse.status, 409);
+
+        // 8. Invalid customer details must be rejected
+        const invalidResponse = await request(app)
+            .post("/api/users")
+            .set("Authorization", `Bearer ${adminToken}`)
+            .send({
+                name: "A",
+                email: "invalid-email",
+                password: "123"
+            });
+
+        assert.equal(invalidResponse.status, 400);
+
+        // 9. A regular customer must not create another customer
+        const forbiddenResponse = await request(app)
+            .post("/api/users")
+            .set("Authorization", `Bearer ${customerToken}`)
+            .send({
+                name: "Unauthorized Customer",
+                email: `unauthorized-${uniqueId}@balancevault.local`,
+                password: "SecureTestPass123!"
+            });
+
+        assert.equal(forbiddenResponse.status, 403);
+
+    } finally {
+        // 10. Clean up only records created by this test
+        if (accountId) {
+            await prisma.account.deleteMany({
+                where: { id: accountId }
+            });
+        }
+
+        if (ledgerAccountId) {
+            await prisma.ledgerAccount.deleteMany({
+                where: { id: ledgerAccountId }
+            });
+        }
+
+        if (adminId) {
+            await prisma.auditEvent.deleteMany({
+                where: { actorId: adminId }
+            });
+        }
+
+        const userIds = [adminId, customerId].filter(Boolean);
+
+        if (userIds.length) {
+            await prisma.user.deleteMany({
+                where: { id: { in: userIds } }
+            });
+        }
+
+        await prisma.user.deleteMany({
+            where: {
+                email: `regular-${uniqueId}@balancevault.local`
+            }
+        });
+    }
+});
+
+
+test("Admin can deactivate and reactivate customers securely", async () => {
+    await prisma.$connect();
+
+    const uniqueId = crypto.randomUUID();
+
+    let adminId;
+    let customerId;
+
+    try {
+        // 1. Create temporary admin and customer
+        const admin = await prisma.user.create({
+            data: {
+                name: "Status Test Admin",
+                email: `status-admin-${uniqueId}@balancevault.local`,
+                passwordHash: "test-only-hash",
+                role: "ADMIN"
+            }
+        });
+        adminId = admin.id;
+
+        const customer = await prisma.user.create({
+            data: {
+                name: "Status Test Customer",
+                email: `status-customer-${uniqueId}@balancevault.local`,
+                passwordHash: "test-only-hash",
+                role: "ACCOUNT_HOLDER"
+            }
+        });
+        customerId = customer.id;
+
+        const adminToken = jwt.sign({}, process.env.JWT_SECRET, {
+            algorithm: "HS256",
+            subject: admin.id,
+            issuer: "balancevault-api",
+            audience: "balancevault-client",
+            expiresIn: "5m"
+        });
+
+        const customerToken = jwt.sign({}, process.env.JWT_SECRET, {
+            algorithm: "HS256",
+            subject: customer.id,
+            issuer: "balancevault-api",
+            audience: "balancevault-client",
+            expiresIn: "5m"
+        });
+
+        // 2. Deactivate customer
+        const deactivate = await request(app)
+            .patch(`/api/users/${customer.id}/deactivate`)
+            .set("Authorization", `Bearer ${adminToken}`);
+
+        assert.equal(deactivate.status, 200);
+        assert.equal(deactivate.body.customer.isActive, false);
+
+        // 3. Verify database status
+        let savedCustomer = await prisma.user.findUnique({
+            where: { id: customer.id }
+        });
+        assert.equal(savedCustomer.isActive, false);
+
+        // 4. Existing customer token must now be rejected
+        const blockedRequest = await request(app)
+            .get("/api/auth/me")
+            .set("Authorization", `Bearer ${customerToken}`);
+
+        assert.equal(blockedRequest.status, 401);
+
+        // 5. Repeated deactivation should be rejected
+        const repeatedDeactivate = await request(app)
+            .patch(`/api/users/${customer.id}/deactivate`)
+            .set("Authorization", `Bearer ${adminToken}`);
+
+        assert.equal(repeatedDeactivate.status, 409);
+
+        // 6. Reactivate customer
+        const activate = await request(app)
+            .patch(`/api/users/${customer.id}/activate`)
+            .set("Authorization", `Bearer ${adminToken}`);
+
+        assert.equal(activate.status, 200);
+        assert.equal(activate.body.customer.isActive, true);
+
+        // 7. Verify database status
+        savedCustomer = await prisma.user.findUnique({
+            where: { id: customer.id }
+        });
+        assert.equal(savedCustomer.isActive, true);
+
+        // 8. Existing token should work again
+        const restoredRequest = await request(app)
+            .get("/api/auth/me")
+            .set("Authorization", `Bearer ${customerToken}`);
+
+        assert.equal(restoredRequest.status, 200);
+
+        // 9. Repeated activation should be rejected
+        const repeatedActivate = await request(app)
+            .patch(`/api/users/${customer.id}/activate`)
+            .set("Authorization", `Bearer ${adminToken}`);
+
+        assert.equal(repeatedActivate.status, 409);
+
+        // 10. Verify audit events
+        const auditEvents = await prisma.auditEvent.findMany({
+            where: {
+                actorId: admin.id,
+                targetId: customer.id,
+                action: {
+                    in: [
+                        "CUSTOMER_DEACTIVATED",
+                        "CUSTOMER_ACTIVATED"
+                    ]
+                }
+            }
+        });
+
+        assert.equal(auditEvents.length, 2);
+
+        assert.ok(
+            auditEvents.some(event => event.action === "CUSTOMER_DEACTIVATED")
+        );
+        assert.ok(
+            auditEvents.some(event => event.action === "CUSTOMER_ACTIVATED")
+        );
+
+    } finally {
+        const userIds = [adminId, customerId].filter(Boolean);
+
+        if (userIds.length) {
+            await prisma.auditEvent.deleteMany({
+                where: { actorId: { in: userIds } }
+            });
+
+            await prisma.user.deleteMany({
+                where: { id: { in: userIds } }
+            });
+        }
+    }
+});
+
+
+test("Admin can securely reset customer passwords and invalidate old tokens", async () => {
+    await prisma.$connect();
+
+    const bcrypt = require("bcryptjs");
+    const uniqueId = crypto.randomUUID();
+
+    let adminId;
+    let customerId;
+
+    try {
+        // 1. Create temporary admin
+        const admin = await prisma.user.create({
+            data: {
+                name: "Password Reset Admin",
+                email: `reset-admin-${uniqueId}@balancevault.local`,
+                passwordHash: "test-only-hash",
+                role: "ADMIN"
+            }
+        });
+        adminId = admin.id;
+
+        // 2. Create customer with an existing password
+        const oldPassword = "OldPassword123";
+        const newPassword = "NewPassword456";
+
+        const customer = await prisma.user.create({
+            data: {
+                name: "Password Reset Customer",
+                email: `reset-customer-${uniqueId}@balancevault.local`,
+                passwordHash: await bcrypt.hash(oldPassword, 12),
+                role: "ACCOUNT_HOLDER"
+            }
+        });
+        customerId = customer.id;
+
+        // 3. Generate admin and customer tokens
+        const adminToken = jwt.sign(
+            { tokenVersion: 0 },
+            process.env.JWT_SECRET,
+            {
+                algorithm: "HS256",
+                subject: admin.id,
+                issuer: "balancevault-api",
+                audience: "balancevault-client",
+                expiresIn: "5m"
+            }
+        );
+
+        const customerToken = jwt.sign(
+            { tokenVersion: 0 },
+            process.env.JWT_SECRET,
+            {
+                algorithm: "HS256",
+                subject: customer.id,
+                issuer: "balancevault-api",
+                audience: "balancevault-client",
+                expiresIn: "5m"
+            }
+        );
+
+        // 4. Non-admin must not reset passwords
+        const forbidden = await request(app)
+            .patch(`/api/users/${customer.id}/password`)
+            .set("Authorization", `Bearer ${customerToken}`)
+            .send({ newPassword });
+
+        assert.equal(forbidden.status, 403);
+
+        // 5. Reject an invalid password
+        const invalidPassword = await request(app)
+            .patch(`/api/users/${customer.id}/password`)
+            .set("Authorization", `Bearer ${adminToken}`)
+            .send({ newPassword: "short" });
+
+        assert.equal(invalidPassword.status, 400);
+
+        // 6. Reject a nonexistent customer
+        const missingCustomer = await request(app)
+            .patch(`/api/users/${crypto.randomUUID()}/password`)
+            .set("Authorization", `Bearer ${adminToken}`)
+            .send({ newPassword });
+
+        assert.equal(missingCustomer.status, 404);
+
+        // 7. Admin resets the customer's password
+        const reset = await request(app)
+            .patch(`/api/users/${customer.id}/password`)
+            .set("Authorization", `Bearer ${adminToken}`)
+            .send({ newPassword });
+
+        assert.equal(reset.status, 200);
+        assert.equal(reset.body.customer.id, customer.id);
+        assert.equal(reset.body.customer.role, "ACCOUNT_HOLDER");
+
+        // Password and hash must never appear in the response
+        assert.equal(Object.hasOwn(reset.body.customer, "password"), false);
+        assert.equal(Object.hasOwn(reset.body.customer, "passwordHash"), false);
+
+        // 8. Verify the database password and token version
+        const savedCustomer = await prisma.user.findUnique({
+            where: { id: customer.id }
+        });
+
+        assert.equal(savedCustomer.tokenVersion, 1);
+
+        assert.equal(
+            await bcrypt.compare(newPassword, savedCustomer.passwordHash),
+            true
+        );
+
+        assert.equal(
+            await bcrypt.compare(oldPassword, savedCustomer.passwordHash),
+            false
+        );
+
+        // 9. Previously issued customer token must be rejected
+        const oldTokenRequest = await request(app)
+            .get("/api/auth/me")
+            .set("Authorization", `Bearer ${customerToken}`);
+
+        assert.equal(oldTokenRequest.status, 401);
+
+        // 10. Old password must no longer work
+        const oldLogin = await request(app)
+            .post("/api/auth/login")
+            .send({
+                email: customer.email,
+                password: oldPassword
+            });
+
+        assert.equal(oldLogin.status, 401);
+
+        // 11. New password must allow login
+        const newLogin = await request(app)
+            .post("/api/auth/login")
+            .send({
+                email: customer.email,
+                password: newPassword
+            });
+
+        assert.equal(newLogin.status, 200);
+        assert.ok(newLogin.body.token);
+
+        // 12. Newly issued token must work
+        const newTokenRequest = await request(app)
+            .get("/api/auth/me")
+            .set("Authorization", `Bearer ${newLogin.body.token}`);
+
+        assert.equal(newTokenRequest.status, 200);
+
+        // 13. Verify password-reset audit event
+        const auditEvent = await prisma.auditEvent.findFirst({
+            where: {
+                actorId: admin.id,
+                targetId: customer.id,
+                action: "CUSTOMER_PASSWORD_RESET"
+            }
+        });
+
+        assert.ok(auditEvent);
+
+    } finally {
+        const userIds = [adminId, customerId].filter(Boolean);
+
+        if (userIds.length) {
+            await prisma.auditEvent.deleteMany({
+                where: {
+                    OR: [
+                        { actorId: { in: userIds } },
+                        { targetId: { in: userIds } }
+                    ]
+                }
+            });
+
+            await prisma.user.deleteMany({
+                where: { id: { in: userIds } }
+            });
+        }
+    }
+});
+
+
+test("Admin can safely close zero-balance accounts and prevent invalid closures", async () => {
+    await prisma.$connect();
+
+    const uniqueId = crypto.randomUUID();
+
+    let adminId;
+    let customerId;
+    const ledgerIds = [];
+    const accountIds = [];
+
+    try {
+        // 1. Create temporary admin and customer
+        const admin = await prisma.user.create({
+            data: {
+                name: "Account Closure Admin",
+                email: `closure-admin-${uniqueId}@balancevault.local`,
+                passwordHash: "test-only-hash",
+                role: "ADMIN"
+            }
+        });
+        adminId = admin.id;
+
+        const customer = await prisma.user.create({
+            data: {
+                name: "Account Closure Customer",
+                email: `closure-customer-${uniqueId}@balancevault.local`,
+                passwordHash: "test-only-hash",
+                role: "ACCOUNT_HOLDER"
+            }
+        });
+        customerId = customer.id;
+
+        // 2. Create two customer ledger accounts
+        const zeroLedger = await prisma.ledgerAccount.create({
+            data: {
+                code: `CLZ${uniqueId.replace(/-/g, "").slice(0, 16)}`,
+                name: "Closure Zero Balance",
+                type: "CUSTOMER"
+            }
+        });
+        ledgerIds.push(zeroLedger.id);
+
+        const fundedLedger = await prisma.ledgerAccount.create({
+            data: {
+                code: `CLF${uniqueId.replace(/-/g, "").slice(0, 16)}`,
+                name: "Closure Funded Account",
+                type: "CUSTOMER"
+            }
+        });
+        ledgerIds.push(fundedLedger.id);
+
+        // 3. Create one zero-balance and one funded account
+        const zeroAccount = await prisma.account.create({
+            data: {
+                ownerId: customer.id,
+                accountNumber: zeroLedger.code,
+                ledgerAccountId: zeroLedger.id,
+                balancePaise: 0n,
+                currency: "INR"
+            }
+        });
+        accountIds.push(zeroAccount.id);
+
+        const fundedAccount = await prisma.account.create({
+            data: {
+                ownerId: customer.id,
+                accountNumber: fundedLedger.code,
+                ledgerAccountId: fundedLedger.id,
+                balancePaise: 10000n,
+                currency: "INR"
+            }
+        });
+        accountIds.push(fundedAccount.id);
+
+        // 4. Generate admin and customer tokens
+        const adminToken = jwt.sign(
+            { tokenVersion: 0 },
+            process.env.JWT_SECRET,
+            {
+                algorithm: "HS256",
+                subject: admin.id,
+                issuer: "balancevault-api",
+                audience: "balancevault-client",
+                expiresIn: "5m"
+            }
+        );
+
+        const customerToken = jwt.sign(
+            { tokenVersion: 0 },
+            process.env.JWT_SECRET,
+            {
+                algorithm: "HS256",
+                subject: customer.id,
+                issuer: "balancevault-api",
+                audience: "balancevault-client",
+                expiresIn: "5m"
+            }
+        );
+
+        // 5. Non-admin customer must not close an account
+        const forbidden = await request(app)
+            .patch(`/api/accounts/${zeroAccount.id}/close`)
+            .set("Authorization", `Bearer ${customerToken}`);
+
+        assert.equal(forbidden.status, 403);
+
+        // 6. Admin cannot close an account with money in it
+        const nonZeroBalance = await request(app)
+            .patch(`/api/accounts/${fundedAccount.id}/close`)
+            .set("Authorization", `Bearer ${adminToken}`);
+
+        assert.equal(nonZeroBalance.status, 409);
+
+        // Verify the funded account remains active
+        const fundedSaved = await prisma.account.findUnique({
+            where: { id: fundedAccount.id }
+        });
+
+        assert.equal(fundedSaved.status, "ACTIVE");
+        assert.equal(fundedSaved.balancePaise, 10000n);
+
+        // 7. Admin successfully closes the zero-balance account
+        const closeResponse = await request(app)
+            .patch(`/api/accounts/${zeroAccount.id}/close`)
+            .set("Authorization", `Bearer ${adminToken}`);
+
+        assert.equal(closeResponse.status, 200);
+        assert.equal(closeResponse.body.account.status, "CLOSED");
+        assert.equal(closeResponse.body.account.balancePaise, "0");
+
+        // 8. Verify the account is actually closed in the database
+        const closedAccount = await prisma.account.findUnique({
+            where: { id: zeroAccount.id }
+        });
+
+        assert.equal(closedAccount.status, "CLOSED");
+        assert.equal(closedAccount.balancePaise, 0n);
+
+        // 9. Repeated closure must be rejected
+        const repeatedClose = await request(app)
+            .patch(`/api/accounts/${zeroAccount.id}/close`)
+            .set("Authorization", `Bearer ${adminToken}`);
+
+        assert.equal(repeatedClose.status, 409);
+
+        // 10. Non-existent account must return 404
+        const missingAccount = await request(app)
+            .patch(`/api/accounts/${crypto.randomUUID()}/close`)
+            .set("Authorization", `Bearer ${adminToken}`);
+
+        assert.equal(missingAccount.status, 404);
+
+        // 11. Verify the administrative audit event
+        const auditEvent = await prisma.auditEvent.findFirst({
+            where: {
+                actorId: admin.id,
+                targetId: zeroAccount.id,
+                action: "ACCOUNT_CLOSED"
+            }
+        });
+
+        assert.ok(auditEvent, "Account closure must create an audit event");
+
+    } finally {
+        // 12. Clean up only records created by this test
+        const userIds = [adminId, customerId].filter(Boolean);
+
+        await prisma.auditEvent.deleteMany({
+            where: {
+                OR: [
+                    ...(userIds.length
+                        ? [{ actorId: { in: userIds } }]
+                        : []),
+                    ...(accountIds.length
+                        ? [{ targetId: { in: accountIds } }]
+                        : [])
+                ]
+            }
+        });
+
+        if (accountIds.length) {
+            await prisma.account.deleteMany({
+                where: { id: { in: accountIds } }
+            });
+        }
+
+        if (ledgerIds.length) {
+            await prisma.ledgerAccount.deleteMany({
+                where: { id: { in: ledgerIds } }
+            });
+        }
+
+        if (userIds.length) {
+            await prisma.user.deleteMany({
+                where: { id: { in: userIds } }
+            });
+        }
+    }
+});
+
+
 test("Database rejects zero and negative ledger amounts", async () => {
   await assert.rejects(
     prisma.ledgerEntry.create({

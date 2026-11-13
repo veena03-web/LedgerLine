@@ -54,8 +54,9 @@ model User {
   name         String   @db.VarChar(100)
   email        String   @unique @db.VarChar(255)
   passwordHash String   @db.VarChar(255)
-  role         UserRole @default(ACCOUNT_HOLDER)
+    role         UserRole @default(ACCOUNT_HOLDER)
   isActive     Boolean  @default(true)
+  tokenVersion Int      @default(0)
 
   accounts     Account[]
   transactions Transaction[]

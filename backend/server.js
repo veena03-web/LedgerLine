@@ -10,6 +10,7 @@ const prisma = require("./src/config/prisma");
 const authRoutes = require("./src/routes/authRoutes");
 const accountRoutes = require("./src/routes/accountRoutes");
 const transactionRoutes = require("./src/routes/transactionRoutes");
+const userRoutes = require("./src/routes/userRoutes");
 
 const app = express();
 
@@ -27,6 +28,7 @@ app.use(express.json());
 app.use("/api/auth", authRoutes);
 app.use("/api/accounts", accountRoutes);
 app.use("/api/transactions", transactionRoutes);
+app.use("/api/users", userRoutes);
 
 app.get("/", (req, res) => {
   res.json({ message: "Welcome to BalanceVault API" });
