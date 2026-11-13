@@ -9,8 +9,10 @@ const {
 
 const {
   transferMoney,
-  depositMoney
+  depositMoney,
+  withdrawMoney
 } = require("../controllers/transactionController");
+
 
 const {
   getTransactionHistory
@@ -30,6 +32,13 @@ router.post(
   authenticate,
   authorize("ADMIN"),
   depositMoney
+);
+// Withdraw money: account holders only
+router.post(
+  "/withdraw",
+  authenticate,
+  authorize("ACCOUNT_HOLDER"),
+  withdrawMoney
 );
 
 // Transaction history: account holders, admins and auditors

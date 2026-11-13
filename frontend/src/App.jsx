@@ -20,6 +20,11 @@ function App() {
   const [transfer, setTransfer] = useState({ sourceAccountId: "", destinationAccountId: "", amount: "" });
   const [deposit, setDeposit] = useState({ destinationAccountId: "", amount: "" });
 
+  const [withdrawal, setWithdrawal] = useState({
+  sourceAccountId: "",
+  amount: ""
+});
+
   const isAdmin = user?.role === "ADMIN";
   const isAuditor = user?.role === "AUDITOR";
   const isAccountHolder = user?.role === "ACCOUNT_HOLDER";
@@ -190,6 +195,38 @@ function App() {
     }
   }
 
+
+async function makeWithdrawal(e) {
+  e.preventDefault();
+  setLoading(true);
+
+  try {
+    await request("/api/transactions/withdraw", {
+      method: "POST",
+      headers: { "Idempotency-Key": crypto.randomUUID() },
+      body: JSON.stringify({
+        sourceAccountId: withdrawal.sourceAccountId,
+        amountPaise: String(
+          Math.round(Number(withdrawal.amount) * 100)
+        )
+      })
+    });
+
+    notify("Withdrawal completed successfully.");
+
+    setWithdrawal({ sourceAccountId: "", amount: "" });
+
+    await loadAccounts();
+    await loadHistory(1);
+
+    setActiveTab("history");
+  } catch (error) {
+    notify(error.message, "error");
+  } finally {
+    setLoading(false);
+  }
+}
+
   function logout() {
     localStorage.removeItem("token");
     setToken("");
@@ -210,6 +247,7 @@ function App() {
     { id: "overview", label: "Overview", icon: "⌂", show: true },
     { id: "accounts", label: isAdmin ? "Customer accounts" : "My accounts", icon: "▤", show: true },
     { id: "transfer", label: "Transfer money", icon: "↗", show: isAccountHolder },
+    { id: "withdraw", label: "Withdraw money", icon: "↓", show: isAccountHolder },
     { id: "deposit", label: "Admin deposit", icon: "＋", show: isAdmin },
     { id: "history", label: "Transactions", icon: "↻", show: true }
   ].filter((item) => item.show);
@@ -374,6 +412,7 @@ function App() {
               <div className="quick-actions">
                 <button className="quick-action" onClick={() => changeTab("accounts")}><span>▤</span><strong>View accounts</strong><small>Check balances and status</small></button>
                 {isAccountHolder && <button className="quick-action" onClick={() => changeTab("transfer")}><span>↗</span><strong>Transfer money</strong><small>Send money securely</small></button>}
+                {isAccountHolder && <button className="quick-action" onClick={() => changeTab("withdraw")}><span>↓</span><strong>Withdraw money</strong><small>Withdraw from your account</small></button>}
                 {isAdmin && <button className="quick-action" onClick={() => changeTab("deposit")}><span>＋</span><strong>Admin deposit</strong><small>Add funds to an account</small></button>}
                 <button className="quick-action" onClick={() => changeTab("history")}><span>↻</span><strong>Transactions</strong><small>Review transaction records</small></button>
               </div>
@@ -443,6 +482,83 @@ function App() {
             <p className="form-footnote">Transfers are checked for account ownership, available balance and duplicate requests.</p>
           </section>
         )}
+
+
+{activeTab === "withdraw" && isAccountHolder && (
+  <section className="content-panel page-panel transaction-panel">
+    <div className="panel-heading">
+      <div>
+        <span className="eyebrow">ACCOUNT SERVICES</span>
+        <h2>Withdraw money</h2>
+        <p className="muted">
+          Withdraw funds from your available account balance.
+        </p>
+      </div>
+      <span className="panel-icon">↓</span>
+    </div>
+
+    <form onSubmit={makeWithdrawal} className="transaction-form">
+      <label>
+        From account
+        <select
+          required
+          value={withdrawal.sourceAccountId}
+          onChange={(e) =>
+            setWithdrawal({
+              ...withdrawal,
+              sourceAccountId: e.target.value
+            })
+          }
+        >
+          <option value="">Choose your account</option>
+
+          {accounts
+            .filter(
+              (account) =>
+                account.status === "ACTIVE" &&
+                Number(account.balancePaise) > 0
+            )
+            .map((account) => (
+              <option key={account.id} value={account.id}>
+                {account.accountNumber} · {money(account.balancePaise)}
+              </option>
+            ))}
+        </select>
+      </label>
+
+      <label>
+        Amount (₹)
+        <input
+          required
+          type="number"
+          min="0.01"
+          step="0.01"
+          placeholder="0.00"
+          value={withdrawal.amount}
+          onChange={(e) =>
+            setWithdrawal({
+              ...withdrawal,
+              amount: e.target.value
+            })
+          }
+        />
+      </label>
+
+      <button
+        className="primary-btn form-btn"
+        disabled={loading || accounts.length === 0}
+      >
+        {loading ? "Processing..." : "Withdraw money →"}
+      </button>
+    </form>
+
+    <p className="form-footnote">
+      Withdrawals are checked against account ownership and available
+      balance, and recorded using double-entry ledger accounting.
+    </p>
+  </section>
+)}
+
 
         {activeTab === "deposit" && isAdmin && (
           <section className="content-panel page-panel transaction-panel">

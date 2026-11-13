@@ -2,6 +2,16 @@
 const crypto = require("crypto");
 const prisma = require("../config/prisma");
 
+
+
+const runReadCommittedTransaction = async (operation) => {
+  return await prisma.$transaction(operation, {
+    isolationLevel: "ReadCommitted"
+  });
+};
+
+
+
 const transferMoney = async (req, res) => {
     try {
         const { sourceAccountId, destinationAccountId, amountPaise } = req.body;
@@ -34,7 +44,7 @@ const transferMoney = async (req, res) => {
             }))
             .digest("hex");
 
-        const result = await prisma.$transaction(async (tx) => {
+        const result = await runReadCommittedTransaction(async (tx) => {
 
             // Check whether this request was already processed
             const existing = await tx.transaction.findUnique({
@@ -159,8 +169,6 @@ await tx.ledgerEntry.createMany({
             });
 
             return { transaction };
-        }, {
-            isolationLevel: "Serializable"
         });
 
         if (result.error) {
@@ -378,4 +386,201 @@ const depositMoney = async (req, res) => {
   }
 };
 
-module.exports = { transferMoney, depositMoney };
+
+const withdrawMoney = async (req, res) => {
+  try {
+    const { sourceAccountId, amountPaise } = req.body;
+    const idempotencyKey = req.headers["idempotency-key"];
+
+    if (
+      !sourceAccountId ||
+      typeof amountPaise !== "string" ||
+      !/^[1-9]\d*$/.test(amountPaise) ||
+      BigInt(amountPaise) > 9007199254740991n ||
+      typeof idempotencyKey !== "string" ||
+      idempotencyKey.length < 8 ||
+      idempotencyKey.length > 128
+    ) {
+      return res.status(400).json({
+        message: "Invalid withdrawal details or idempotency key."
+      });
+    }
+
+    const amount = BigInt(amountPaise);
+
+    const requestHash = crypto
+      .createHash("sha256")
+      .update(JSON.stringify({ sourceAccountId, amountPaise }))
+      .digest("hex");
+
+    const result = await prisma.$transaction(async (tx) => {
+      // Check duplicate requests
+      const existing = await tx.transaction.findUnique({
+        where: {
+          initiatedById_idempotencyKey: {
+            initiatedById: req.user.id,
+            idempotencyKey
+          }
+        }
+      });
+
+      if (existing) {
+        if (existing.requestHash !== requestHash) {
+          return { error: "IDEMPOTENCY_CONFLICT" };
+        }
+        return { existing };
+      }
+
+      // Lock the customer's account
+      const accounts = await tx.$queryRaw`
+        SELECT id, "ownerId", "ledgerAccountId",
+               "balancePaise", status
+        FROM "Account"
+        WHERE id = ${sourceAccountId}::uuid
+        FOR UPDATE
+      `;
+
+      const account = accounts[0];
+
+      if (!account) return { error: "ACCOUNT_NOT_FOUND" };
+
+      if (account.ownerId !== req.user.id) {
+        return { error: "SOURCE_NOT_OWNED" };
+      }
+
+      if (account.status !== "ACTIVE") {
+        return { error: "ACCOUNT_INACTIVE" };
+      }
+
+      if (account.balancePaise < amount) {
+        return { error: "INSUFFICIENT_BALANCE" };
+      }
+
+      // Get or create the system cash-clearing ledger account
+      const clearingAccount = await tx.ledgerAccount.upsert({
+        where: { code: "SYSTEM_CASH_CLEARING" },
+        update: {},
+        create: {
+          code: "SYSTEM_CASH_CLEARING",
+          name: "System Cash Clearing",
+          type: "CASH_CLEARING"
+        }
+      });
+
+      // Create withdrawal transaction
+      const transaction = await tx.transaction.create({
+        data: {
+          type: "WITHDRAWAL",
+          amountPaise: amount,
+          sourceAccountId,
+          initiatedById: req.user.id,
+          idempotencyKey,
+          requestHash,
+          status: "POSTED"
+        }
+      });
+
+      // Deduct money from customer account
+      const updatedAccount = await tx.account.update({
+        where: { id: sourceAccountId },
+        data: { balancePaise: { decrement: amount } }
+      });
+
+      // Create balanced double-entry ledger records
+      await tx.ledgerEntry.createMany({
+        data: [
+          {
+            transactionId: transaction.id,
+            ledgerAccountId: account.ledgerAccountId,
+            initiatedById: req.user.id,
+            lineNumber: 1,
+            side: "DEBIT",
+            amountPaise: amount,
+            balanceAfterPaise: updatedAccount.balancePaise
+          },
+          {
+            transactionId: transaction.id,
+            ledgerAccountId: clearingAccount.id,
+            initiatedById: req.user.id,
+            lineNumber: 2,
+            side: "CREDIT",
+            amountPaise: amount
+          }
+        ]
+      });
+
+      // Record audit event
+      await tx.auditEvent.create({
+        data: {
+          actorId: req.user.id,
+          action: "MONEY_WITHDRAWN",
+          targetType: "Transaction",
+          targetId: transaction.id,
+          ipAddress: req.ip
+        }
+      });
+
+      return { transaction, updatedAccount };
+    }, {
+      isolationLevel: "Serializable"
+    });
+
+    const errors = {
+      IDEMPOTENCY_CONFLICT: [409, "Idempotency key reused with different details."],
+      ACCOUNT_NOT_FOUND: [404, "Account not found."],
+      SOURCE_NOT_OWNED: [403, "You do not own this account."],
+      ACCOUNT_INACTIVE: [409, "Account is not active."],
+      INSUFFICIENT_BALANCE: [409, "Insufficient balance."]
+    };
+
+    if (result.error) {
+      const [status, message] = errors[result.error];
+      return res.status(status).json({ message });
+    }
+
+    const transaction = result.transaction || result.existing;
+
+    return res.status(result.existing ? 200 : 201).json({
+      message: result.existing
+        ? "Withdrawal already processed."
+        : "Withdrawal successful.",
+      transaction: {
+        id: transaction.id,
+        type: transaction.type,
+        amountPaise: transaction.amountPaise.toString(),
+        status: transaction.status,
+        sourceAccountId: transaction.sourceAccountId,
+        createdAt: transaction.createdAt
+      },
+      balancePaise: result.updatedAccount
+        ? result.updatedAccount.balancePaise.toString()
+        : undefined
+    });
+
+  } catch (error) {
+    console.error("Withdrawal error:", error.message);
+
+    if (
+      error.code === "P2002" ||
+      error.code === "P2034" ||
+      error.code === "40001" ||
+      error.meta?.code === "40001" ||
+      error.cause?.code === "40001"
+    ) {
+      return res.status(409).json({
+        message: "Transaction conflict. Retry using the same idempotency key."
+      });
+    }
+
+    return res.status(500).json({
+      message: "Withdrawal failed."
+    });
+  }
+};
+
+module.exports = {
+  transferMoney,
+  depositMoney,
+  withdrawMoney
+};
+

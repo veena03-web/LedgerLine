@@ -732,6 +732,256 @@ test("Concurrent transfers cannot spend the same balance twice", async () => {
 });
 
 
+test("Withdrawal debits the account and prevents duplicate or unauthorized withdrawals", async () => {
+  await prisma.$connect();
+
+  const uniqueId = crypto.randomUUID();
+
+  let adminId;
+  let customerId;
+  let otherCustomerId;
+  const ledgerIds = [];
+  const accountIds = [];
+
+  try {
+    // 1. Create admin and two customers
+    const admin = await prisma.user.create({
+      data: {
+        name: "Withdrawal Test Admin",
+        email: `withdraw-admin-${uniqueId}@balancevault.local`,
+        passwordHash: "test-only-hash",
+        role: "ADMIN"
+      }
+    });
+    adminId = admin.id;
+
+    const customer = await prisma.user.create({
+      data: {
+        name: "Withdrawal Test Customer",
+        email: `withdraw-customer-${uniqueId}@balancevault.local`,
+        passwordHash: "test-only-hash",
+        role: "ACCOUNT_HOLDER"
+      }
+    });
+    customerId = customer.id;
+
+    const otherCustomer = await prisma.user.create({
+      data: {
+        name: "Other Withdrawal Customer",
+        email: `withdraw-other-${uniqueId}@balancevault.local`,
+        passwordHash: "test-only-hash",
+        role: "ACCOUNT_HOLDER"
+      }
+    });
+    otherCustomerId = otherCustomer.id;
+
+    // 2. Create two ledger accounts
+    const sourceLedger = await prisma.ledgerAccount.create({
+      data: {
+        code: `WDS${uniqueId.replace(/-/g, "").slice(0, 16)}`,
+        name: "Withdrawal Test Source",
+        type: "CUSTOMER"
+      }
+    });
+    ledgerIds.push(sourceLedger.id);
+
+    const otherLedger = await prisma.ledgerAccount.create({
+      data: {
+        code: `WDO${uniqueId.replace(/-/g, "").slice(0, 16)}`,
+        name: "Other Customer Account",
+        type: "CUSTOMER"
+      }
+    });
+    ledgerIds.push(otherLedger.id);
+
+    // 3. Create customer accounts
+    const account = await prisma.account.create({
+      data: {
+        ownerId: customer.id,
+        accountNumber: sourceLedger.code,
+        ledgerAccountId: sourceLedger.id,
+        balancePaise: 0,
+        currency: "INR"
+      }
+    });
+    accountIds.push(account.id);
+
+    const otherAccount = await prisma.account.create({
+      data: {
+        ownerId: otherCustomer.id,
+        accountNumber: otherLedger.code,
+        ledgerAccountId: otherLedger.id,
+        balancePaise: 0,
+        currency: "INR"
+      }
+    });
+    accountIds.push(otherAccount.id);
+
+    // 4. Generate JWT tokens
+    const adminToken = jwt.sign({}, process.env.JWT_SECRET, {
+      algorithm: "HS256",
+      subject: admin.id,
+      issuer: "balancevault-api",
+      audience: "balancevault-client",
+      expiresIn: "5m"
+    });
+
+    const customerToken = jwt.sign({}, process.env.JWT_SECRET, {
+      algorithm: "HS256",
+      subject: customer.id,
+      issuer: "balancevault-api",
+      audience: "balancevault-client",
+      expiresIn: "5m"
+    });
+
+    // 5. Deposit ₹100 into the customer's account
+    const deposit = await request(app)
+      .post("/api/transactions/deposit")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .set("Idempotency-Key", `withdraw-deposit-${uniqueId}`)
+      .send({
+        destinationAccountId: account.id,
+        amountPaise: "10000"
+      });
+
+    assert.equal(deposit.status, 201);
+
+    // 6. Withdraw ₹40
+    const withdrawalKey = `withdraw-${uniqueId}`;
+
+    const withdrawal = await request(app)
+      .post("/api/transactions/withdraw")
+      .set("Authorization", `Bearer ${customerToken}`)
+      .set("Idempotency-Key", withdrawalKey)
+      .send({
+        sourceAccountId: account.id,
+        amountPaise: "4000"
+      });
+
+    assert.equal(withdrawal.status, 201);
+    assert.equal(withdrawal.body.transaction.amountPaise, "4000");
+    assert.equal(withdrawal.body.transaction.type, "WITHDRAWAL");
+
+    // 7. Repeat the same request: it must not withdraw twice
+    const duplicate = await request(app)
+      .post("/api/transactions/withdraw")
+      .set("Authorization", `Bearer ${customerToken}`)
+      .set("Idempotency-Key", withdrawalKey)
+      .send({
+        sourceAccountId: account.id,
+        amountPaise: "4000"
+      });
+
+    assert.equal(duplicate.status, 200);
+    assert.equal(
+      duplicate.body.transaction.id,
+      withdrawal.body.transaction.id
+    );
+
+    // 8. Verify the account balance is ₹60
+    const updatedAccount = await prisma.account.findUnique({
+      where: { id: account.id }
+    });
+
+    assert.equal(updatedAccount.balancePaise, 6000n);
+
+    // 9. Verify withdrawal ledger entries
+    const transaction = await prisma.transaction.findUnique({
+      where: { id: withdrawal.body.transaction.id },
+      include: { entries: true }
+    });
+
+    assert.equal(transaction.entries.length, 2);
+
+    const debit = transaction.entries.find(
+      entry => entry.side === "DEBIT"
+    );
+
+    const credit = transaction.entries.find(
+      entry => entry.side === "CREDIT"
+    );
+
+    assert.ok(debit);
+    assert.ok(credit);
+    assert.equal(debit.amountPaise, 4000n);
+assert.equal(credit.amountPaise, 4000n);
+    assert.equal(debit.ledgerAccountId, sourceLedger.id);
+
+    // 10. Attempt to withdraw more than the remaining balance
+    const overdraft = await request(app)
+      .post("/api/transactions/withdraw")
+      .set("Authorization", `Bearer ${customerToken}`)
+      .set("Idempotency-Key", `withdraw-over-${uniqueId}`)
+      .send({
+        sourceAccountId: account.id,
+        amountPaise: "7000"
+      });
+
+    assert.equal(overdraft.status, 409);
+
+    // 11. Attempt to withdraw from another customer's account
+    const unauthorized = await request(app)
+      .post("/api/transactions/withdraw")
+      .set("Authorization", `Bearer ${customerToken}`)
+      .set("Idempotency-Key", `withdraw-other-${uniqueId}`)
+      .send({
+        sourceAccountId: otherAccount.id,
+        amountPaise: "1000"
+      });
+
+    assert.notEqual(unauthorized.status, 201);
+
+    // 12. Confirm the original balance was not changed by failed requests
+    const finalAccount = await prisma.account.findUnique({
+      where: { id: account.id }
+    });
+
+    assert.equal(finalAccount.balancePaise, 6000n);
+
+  } finally {
+    const actorIds = [adminId, customerId, otherCustomerId].filter(Boolean);
+
+    if (actorIds.length) {
+      await prisma.ledgerEntry.deleteMany({
+        where: { initiatedById: { in: actorIds } }
+      });
+
+      await prisma.transaction.deleteMany({
+        where: { initiatedById: { in: actorIds } }
+      });
+
+      await prisma.auditEvent.deleteMany({
+        where: { actorId: { in: actorIds } }
+      });
+    }
+
+    if (accountIds.length) {
+      await prisma.account.deleteMany({
+        where: { id: { in: accountIds } }
+      });
+    }
+
+    if (ledgerIds.length) {
+      await prisma.ledgerAccount.deleteMany({
+        where: { id: { in: ledgerIds } }
+      });
+    }
+
+    if (customerId) {
+      await prisma.user.deleteMany({ where: { id: customerId } });
+    }
+
+    if (otherCustomerId) {
+      await prisma.user.deleteMany({ where: { id: otherCustomerId } });
+    }
+
+    if (adminId) {
+      await prisma.user.deleteMany({ where: { id: adminId } });
+    }
+  }
+});
+
+
 test("Database rejects zero and negative ledger amounts", async () => {
   await assert.rejects(
     prisma.ledgerEntry.create({
